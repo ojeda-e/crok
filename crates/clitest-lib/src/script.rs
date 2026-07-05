@@ -1,8 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     path::Path,
-    process::ExitStatus,
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{Arc, atomic::AtomicBool},
     thread::ScopedJoinHandle,
     time::{Duration, Instant},
 };
@@ -567,114 +566,6 @@ impl ScriptKillReceiver {
             res
         })
     }
-
-    #[cfg(windows)]
-    pub fn run_cmd(
-        &self,
-        output: std::process::Child,
-        warn_time: Duration,
-    ) -> std::io::Result<ExitStatus> {
-        use std::os::windows::io::AsRawHandle;
-        use win32job::Job;
-
-        fn map_job_error(e: win32job::JobError) -> std::io::Error {
-            match e {
-                win32job::JobError::AssignFailed(e) => e,
-                win32job::JobError::CreateFailed(e) => e,
-                win32job::JobError::GetInfoFailed(e) => e,
-                win32job::JobError::SetInfoFailed(e) => e,
-                _ => std::io::Error::new(std::io::ErrorKind::Other, "Unknown error"),
-            }
-        }
-
-        // Create a new Job object
-        let job = Job::create().map_err(map_job_error)?;
-
-        // Configure the job to terminate all child processes when the job is closed
-        let mut info = job.query_extended_limit_info().map_err(map_job_error)?;
-        info.limit_kill_on_job_close();
-        job.set_extended_limit_info(&info).map_err(map_job_error)?;
-        job.assign_process(output.as_raw_handle() as _)?;
-
-        // Resume the main thread for the process
-        let id = output.id();
-        for thread_entry in tlhelp32::Snapshot::new_thread()? {
-            if thread_entry.owner_process_id == id {
-                use windows_sys::Win32::Foundation::CloseHandle;
-                use windows_sys::Win32::System::Threading::*;
-
-                unsafe {
-                    let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, thread_entry.thread_id);
-                    if thread.is_null() {
-                        return Err(std::io::Error::last_os_error().into());
-                    }
-                    ResumeThread(thread);
-                    CloseHandle(thread);
-                }
-            }
-        }
-
-        let job = Mutex::new(Some(job));
-        let output = Mutex::new(output);
-        self.run_with(
-            || {
-                _ = job.lock().unwrap().take();
-                _ = output.lock().unwrap().kill();
-            },
-            || {
-                let start = std::time::Instant::now();
-                let mut warned = false;
-                loop {
-                    let res = output.lock().unwrap().try_wait()?;
-                    if let Some(status) = res {
-                        return Ok::<_, std::io::Error>(status);
-                    }
-                    if start.elapsed() > warn_time {
-                        if !warned {
-                            let child = output.lock().unwrap().id();
-                            eprintln!("Process #{child} taking too long to finish.");
-                            warned = true;
-                        }
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            },
-        )
-    }
-
-    #[cfg(unix)]
-    pub fn run_cmd(
-        &self,
-        output: std::process::Child,
-        warn_time: Duration,
-    ) -> std::io::Result<ExitStatus> {
-        let output = Mutex::new(output);
-        self.run_with(
-            || {
-                use signal_child::{signal, signal::*};
-                let id = output.lock().unwrap().id() as i32;
-                _ = signal(-id, SIGINT);
-                std::thread::sleep(Duration::from_millis(10));
-                _ = signal(-id, SIGTERM);
-            },
-            || {
-                let start = std::time::Instant::now();
-                let mut warned = false;
-                loop {
-                    let res = output.lock().unwrap().try_wait()?;
-                    if let Some(status) = res {
-                        return Ok::<_, std::io::Error>(status);
-                    }
-                    if start.elapsed() > warn_time && !warned {
-                        let child = output.lock().unwrap().id();
-                        eprintln!("Process #{child} taking too long to finish.");
-                        warned = true;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            },
-        )
-    }
 }
 
 #[derive(Clone)]
@@ -984,13 +875,13 @@ pub enum CommandExit {
 impl CommandExit {
     pub fn matches(&self, status: CommandResult) -> bool {
         match (self, status) {
-            (CommandExit::Success, CommandResult::Exit(status)) => status.success(),
-            (CommandExit::Failure(code), CommandResult::Exit(status)) => {
+            (CommandExit::Success, CommandResult::Exit(status, _)) => status.success(),
+            (CommandExit::Failure(code), CommandResult::Exit(status, _)) => {
                 *code == status.code().unwrap_or(-1)
             }
             (CommandExit::Timeout, CommandResult::TimedOut) => true,
             (CommandExit::Any, _) => true,
-            (CommandExit::AnyFailure, CommandResult::Exit(status)) => !status.success(),
+            (CommandExit::AnyFailure, CommandResult::Exit(status, _)) => !status.success(),
             (CommandExit::AnyFailure, _) => true,
             _ => false,
         }
